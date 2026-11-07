@@ -2,44 +2,51 @@ package warmup
 
 import (
 	"errors"
-	"fmt"
-	"io"
 	"time"
 )
 
-// SeedFromFile writes a file's head and tail windows from a local copy that the caller
-// has proven identical to the torrent's file (Dezoxy fork): the library's own disks fill
-// the index cache, so switching a title to streaming costs no swarm traffic. Index mode
-// only. It returns the bytes written to each window.
-func (d *DiskWarmupCache) SeedFromFile(hash string, fileID int, r io.ReaderAt, size int64) (head, tail int64, err error) {
+// Seed is verified bytes of a file at a file-relative offset.
+type Seed struct {
+	Off  int64
+	Data []byte
+}
+
+// SeedSpans writes bytes the caller has verified against the torrent's piece hashes
+// into a file's head and tail windows (Dezoxy fork, index seeding from local copies).
+// The head takes the contiguous run from offset 0, so it stays dense; the tail takes any
+// verified range in its window. Index mode only. It returns the bytes written to each.
+func (d *DiskWarmupCache) SeedSpans(hash string, fileID int, size int64, spans []Seed) (head, tail int64, err error) {
 	if d == nil || !persistTails {
 		return 0, 0, errors.New("index cache not enabled (warmup_dir)")
 	}
 	if size <= 0 {
 		return 0, 0, errors.New("empty file")
 	}
-
 	headLen := min(FileSize, size)
-	if d.GetAvailableRange(hash, fileID) < headLen {
+	for _, s := range spans {
+		if s.Off != 0 {
+			continue
+		}
+		n := min(int64(len(s.Data)), headLen)
+		if d.GetAvailableRange(hash, fileID) >= n {
+			break
+		}
 		// The writer returns the buffer to its pool, so it must come from there.
 		bufPtr := warmupWritePool.Get().(*[]byte)
-		if int64(len(*bufPtr)) < headLen {
-			b := make([]byte, max(int64(warmupWriteBuf), headLen))
+		if int64(len(*bufPtr)) < n {
+			b := make([]byte, max(int64(warmupWriteBuf), n))
 			bufPtr = &b
 		}
-		if _, err := r.ReadAt((*bufPtr)[:headLen], 0); err != nil {
-			warmupWritePool.Put(bufPtr)
-			return 0, 0, fmt.Errorf("read head: %w", err)
-		}
+		copy(*bufPtr, s.Data[:n])
 		// Through the single writer, which keeps the head dense; waiting on the queue
 		// rather than dropping the write as the streaming path may.
-		d.writeCh <- warmupWrite{hash, fileID, bufPtr, int(headLen), 0}
-		deadline := time.Now().Add(30 * time.Second)
+		d.writeCh <- warmupWrite{hash, fileID, bufPtr, int(n), 0}
 		path := d.filePath(hash, fileID)
+		deadline := time.Now().Add(30 * time.Second)
 		for {
 			d.sizeCache.Delete(path)
 			d.missing.Delete(path)
-			if d.GetAvailableRange(hash, fileID) >= headLen {
+			if d.GetAvailableRange(hash, fileID) >= n {
 				break
 			}
 			if time.Now().After(deadline) {
@@ -47,20 +54,18 @@ func (d *DiskWarmupCache) SeedFromFile(hash string, fileID int, r io.ReaderAt, s
 			}
 			time.Sleep(20 * time.Millisecond)
 		}
-		head = headLen
+		head = n
+		break
 	}
 
-	if !d.TailReady(hash, fileID) {
-		tailStart := max(size-TailWarmupSize, 0)
-		buf := make([]byte, size-tailStart)
-		if _, err := r.ReadAt(buf, tailStart); err != nil {
-			return head, 0, fmt.Errorf("read tail: %w", err)
+	tailStart := max(size-TailWarmupSize, 0)
+	for _, s := range spans {
+		a, b := max(s.Off, tailStart), min(s.Off+int64(len(s.Data)), size)
+		if a >= b {
+			continue
 		}
-		d.writeTail(hash, fileID, buf, tailStart, size)
-		if !d.TailReady(hash, fileID) && size >= TailWarmupSize {
-			return head, 0, errors.New("tail write did not complete")
-		}
-		tail = int64(len(buf))
+		d.writeTail(hash, fileID, s.Data[a-s.Off:b-s.Off], a, size)
+		tail += b - a
 	}
 	return head, tail, nil
 }
