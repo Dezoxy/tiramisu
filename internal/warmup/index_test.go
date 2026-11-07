@@ -224,3 +224,30 @@ func TestIndexTailFillWaitsAndWritesTheWholeWindow(t *testing.T) {
 		t.Fatalf("tail read n=%d first=%d", n, buf[0])
 	}
 }
+
+func TestSeedFromFileWritesBothWindows(t *testing.T) {
+	d := indexCache(t, t.TempDir())
+	const size = 5 << 20
+	data := make([]byte, size)
+	for i := range data {
+		data[i] = byte(i % 251)
+	}
+	head, tail, err := d.SeedFromFile("h", 8, bytes.NewReader(data), size)
+	if err != nil || head != 1<<20 || tail != 1<<20 {
+		t.Fatalf("head=%d tail=%d err=%v", head, tail, err)
+	}
+	if !d.HeadReady("h", 8) || !d.TailReady("h", 8) {
+		t.Fatal("seeded windows not ready")
+	}
+	buf := make([]byte, 4096)
+	if n, _ := d.ReadAt("h", 8, buf, 1000); n != 4096 || !bytes.Equal(buf, data[1000:5096]) {
+		t.Fatal("head bytes differ from the source")
+	}
+	if n, _ := d.ReadTail("h", 8, buf, size-4096, size); n != 4096 || !bytes.Equal(buf, data[size-4096:]) {
+		t.Fatal("tail bytes differ from the source")
+	}
+	// Already seeded: nothing to write.
+	if head, tail, err := d.SeedFromFile("h", 8, bytes.NewReader(data), size); err != nil || head != 0 || tail != 0 {
+		t.Fatalf("reseed wrote head=%d tail=%d err=%v", head, tail, err)
+	}
+}
