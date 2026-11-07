@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -18,6 +19,9 @@ import (
 	"tiramisu/internal/vfs"
 	"tiramisu/internal/warmup"
 )
+
+// maxSeedFiles bounds one request's open files and hashing: a season pack is a few dozen.
+const maxSeedFiles = 512
 
 type seedFile struct {
 	Virtual string `json:"virtual"` // path under the FUSE mount, e.g. tv/Show/Season.1/x.mkv
@@ -89,6 +93,11 @@ func handleIndexSeed(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if len(req.Files) > maxSeedFiles {
+		http.Error(w, fmt.Sprintf("at most %d files per request", maxSeedFiles), http.StatusRequestEntityTooLarge)
+		return
+	}
+
 	hash := ""
 	copies := map[int]torr.LocalCopy{}
 	sizes := map[int]int64{}
@@ -108,6 +117,10 @@ func handleIndexSeed(w http.ResponseWriter, r *http.Request) {
 		h, id := vfs.ExtractHashAndIndex(meta.URL)
 		if h == "" || id <= 0 || (hash != "" && h != hash) {
 			http.Error(w, "files must belong to one torrent: "+sf.Virtual, http.StatusBadRequest)
+			return
+		}
+		if _, dup := copies[id]; dup {
+			http.Error(w, "file listed twice: "+sf.Virtual, http.StatusBadRequest)
 			return
 		}
 		hash = h
