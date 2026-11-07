@@ -187,15 +187,17 @@ func (tr *tailRange) complete() bool { return tr.covers(0, TailWarmupSize) }
 // DiskWarmupCache persists the first 128MB of each streamed file to SSD.
 type DiskWarmupCache struct {
 	dir           string
-	mu            sync.Mutex // protects quota enforcement
-	totalSize     int64      // V288: Tracked total size of all warmup files in bytes
-	missing       sync.Map   // path -> time.Time (negative cache for missing files)
-	handles       sync.Map   // path -> *cachedHandle (cached file descriptors)
-	sizeCache     sync.Map   // V264: path -> sizeEntry (cached file sizes with TTL)
-	tailCoverage  sync.Map   // V265: path -> *tailRange (written range tracking)
-	tailFills     sync.Map   // path -> true while a sequential tail fill is running
-	pendingVerify sync.Map   // block key -> true while it waits for its pieces to verify
-	warmupStarts  sync.Map   // path -> time.Time (STARTING timestamp, for duration histogram)
+	mu            sync.Mutex   // protects quota enforcement
+	totalSize     int64        // V288: Tracked total size of all warmup files in bytes
+	missing       sync.Map     // path -> time.Time (negative cache for missing files)
+	handles       sync.Map     // path -> *cachedHandle (cached file descriptors)
+	sizeCache     sync.Map     // V264: path -> sizeEntry (cached file sizes with TTL)
+	tailCoverage  sync.Map     // V265: path -> *tailRange (written range tracking)
+	tailFills     sync.Map     // path -> true while a sequential tail fill is running
+	pendingVerify sync.Map     // block key -> true while it waits for its pieces to verify
+	tailMu        sync.Mutex   // serializes tail writes with each other and with removals
+	removals      atomic.Int64 // bumped by every removal; a waiter older than one drops its block
+	warmupStarts  sync.Map     // path -> time.Time (STARTING timestamp, for duration histogram)
 	writeCh       chan warmupWrite
 }
 
@@ -712,6 +714,11 @@ func (d *DiskWarmupCache) writeTail(hash string, fileID int, data []byte, absolu
 		return
 	}
 
+	// One tail write at a time, and never beside a removal: two creators would truncate
+	// each other's bytes while both record them as covered (Dezoxy fork).
+	d.tailMu.Lock()
+	defer d.tailMu.Unlock()
+
 	tr := d.tailRangeFor(path)
 	if tr.complete() {
 		return
@@ -725,9 +732,18 @@ func (d *DiskWarmupCache) writeTail(hash string, fileID int, data []byte, absolu
 		if err != nil {
 			return
 		}
+		// A new file holds nothing yet: coverage from a removed predecessor must not
+		// carry over, in memory or on disk.
+		d.tailCoverage.Delete(path)
+		os.Remove(path + coverSuffix)
+		tr = d.tailRangeFor(path)
 		tailCh := &cachedHandle{f: f}
 		tailCh.lastUsedNano.Store(time.Now().UnixNano())
-		d.handles.Store(path, tailCh)
+		if old, loaded := d.handles.Swap(path, tailCh); loaded {
+			oc := old.(*cachedHandle)
+			oc.closed.Store(true)
+			oc.f.Close()
+		}
 		logf.Printf("[DiskWarmup] TAIL STARTING %s at relOffset %d", filepath.Base(path), relOffset)
 	}
 
@@ -788,6 +804,9 @@ func (d *DiskWarmupCache) ReadTail(hash string, fileID int, buf []byte, absolute
 }
 
 func (d *DiskWarmupCache) RemoveHash(hash string) {
+	d.tailMu.Lock()
+	defer d.tailMu.Unlock()
+	d.removals.Add(1)
 	entries, _ := os.ReadDir(d.dir)
 	prefix := hash + "-"
 	for _, e := range entries {
@@ -844,6 +863,9 @@ func (d *DiskWarmupCache) enforceQuotaLocked(needed int64) {
 	}
 
 	sort.Slice(files, func(i, j int) bool { return files[i].modTime < files[j].modTime })
+	d.tailMu.Lock()
+	defer d.tailMu.Unlock()
+	d.removals.Add(1)
 	for _, fi := range files {
 		if diskTotal+needed <= quota {
 			break
@@ -959,7 +981,7 @@ func (d *DiskWarmupCache) verified(hash string, fileID int, off int64, data []by
 	if check(hash, fileID, off, n) {
 		return true
 	}
-	key := hash + "-" + strconv.Itoa(fileID) + "@" + strconv.FormatInt(off, 10)
+	key := hash + "-" + strconv.Itoa(fileID) + "@" + strconv.FormatInt(off, 10) + "+" + strconv.FormatInt(n, 10)
 	if _, busy := d.pendingVerify.LoadOrStore(key, true); busy {
 		return false
 	}
@@ -969,16 +991,36 @@ func (d *DiskWarmupCache) verified(hash string, fileID int, off int64, data []by
 		d.pendingVerify.Delete(key)
 		return false // a scan burst: the next open fetches it again
 	}
-	buf := append([]byte(nil), data...)
+	gen := d.removals.Load()
+	fetch, poll, wait := TailFetch, verifyPollInterval, verifyWaitMax
 	go func() {
-		defer func() { <-verifySlots; d.pendingVerify.Delete(key) }()
-		deadline := time.Now().Add(verifyWaitMax)
-		for time.Now().Before(deadline) {
-			time.Sleep(verifyPollInterval)
-			if check(hash, fileID, off, n) {
-				write(buf)
-				return
+		defer func() {
+			if r := recover(); r != nil {
+				logf.Printf("[DiskWarmup] verify waiter panicked: %v", r)
 			}
+			<-verifySlots
+			d.pendingVerify.Delete(key)
+		}()
+		deadline := time.Now().Add(wait)
+		for time.Now().Before(deadline) {
+			time.Sleep(poll)
+			if !check(hash, fileID, off, n) {
+				continue
+			}
+			if d.removals.Load() != gen {
+				return // the file was removed or evicted meanwhile; don't resurrect it
+			}
+			// The bytes held from the read may predate a failed hash and a re-download:
+			// write a fresh copy of the now verified pieces instead.
+			if fetch == nil {
+				break
+			}
+			buf := make([]byte, n)
+			if got, err := fetch(hash, fileID, off, buf); err != nil || int64(got) != n || !check(hash, fileID, off, n) {
+				break
+			}
+			write(buf)
+			return
 		}
 		atomic.AddInt64(&unverifiedDrops, 1)
 	}()
@@ -1002,15 +1044,17 @@ type coverFile struct {
 // saveCoverage makes the tail's written ranges durable: the data first, then the
 // coverage that vouches for it, replaced atomically.
 func (d *DiskWarmupCache) saveCoverage(f *os.File, path string, tailStart, tailLen int64, tr *tailRange) {
-	if err := f.Sync(); err != nil {
-		return
-	}
+	// Snapshot first, then sync: every range in the snapshot was written before the sync,
+	// so the cover never vouches for bytes still in the page cache.
 	tr.mu.Lock()
 	cf := coverFile{TailStart: tailStart, TailLen: tailLen}
 	for _, sp := range tr.ranges {
 		cf.Spans = append(cf.Spans, [2]int64{sp.start, sp.end})
 	}
 	tr.mu.Unlock()
+	if err := f.Sync(); err != nil {
+		return
+	}
 	raw, err := json.Marshal(cf)
 	if err != nil {
 		return

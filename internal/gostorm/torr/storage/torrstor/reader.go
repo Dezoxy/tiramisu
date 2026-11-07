@@ -154,22 +154,33 @@ func (r *Reader) SetReadahead(length int64) {
 	// Cache eviction is LRU-based and doesn't use readahead boundaries.
 	// Unbounded readahead growth is now prevented by maxDefaultReadahead cap in anacrolix fork.
 	atomic.StoreInt64(&r.readahead, length) // AdjustRA writes it without mu
-	if r.isUse {
-		if end := atomic.LoadInt64(&r.rangeEnd); end > 0 {
-			r.Reader.SetReadaheadFunc(func(c torrent.ReadaheadContext) int64 {
-				return clampReadahead(atomic.LoadInt64(&r.readahead), end, c.CurrentPos)
-			})
-		} else {
-			r.Reader.SetReadahead(length)
-		}
+	if !r.isUse {
+		return
 	}
+	if !BoundedReadahead {
+		r.Reader.SetReadahead(length)
+		return
+	}
+	// Read both values when anacrolix asks, not at install time: AdjustRA may run
+	// concurrently with SetRangeEnd, and a fixed value installed by it would drop the clamp.
+	r.Reader.SetReadaheadFunc(func(c torrent.ReadaheadContext) int64 {
+		ra := atomic.LoadInt64(&r.readahead)
+		if end := atomic.LoadInt64(&r.rangeEnd); end > 0 {
+			return clampReadahead(ra, end, c.CurrentPos)
+		}
+		return ra
+	})
 }
+
+// BoundedReadahead stops a bounded range's read-ahead at the range end. Set at startup
+// with pump_on_open off (Dezoxy fork); upstream reads ahead the full window.
+var BoundedReadahead bool
 
 // SetRangeEnd bounds the reader to a request ending at end (exclusive, file offset): a
 // scanner's 64 KB probe then fetches only the pieces it touches, not the read-ahead the
 // stats loop hands every reader. Call before the first read.
 func (r *Reader) SetRangeEnd(end int64) {
-	if end <= 0 {
+	if end <= 0 || !BoundedReadahead {
 		return
 	}
 	atomic.StoreInt64(&r.rangeEnd, end)

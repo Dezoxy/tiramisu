@@ -1,37 +1,46 @@
 package torr
 
-import (
-	"sort"
-
-	"github.com/anacrolix/torrent"
-
-	utils2 "tiramisu/internal/gostorm/utils"
-)
+import "github.com/anacrolix/torrent"
 
 // RangeVerified reports whether every piece covering [off, off+n) of file fileID has
 // passed its checksum (Dezoxy fork). fileID is the 1-based id Status() gives the file,
 // numbered over the files sorted by path.
 func (t *Torrent) RangeVerified(fileID int, off, n int64) bool {
-	if t == nil || t.Torrent == nil || t.Torrent.Info() == nil || n <= 0 || off < 0 {
+	if t == nil || n <= 0 || off < 0 {
 		return false
 	}
-	files := append([]*torrent.File(nil), t.Torrent.Files()...)
-	sort.Slice(files, func(i, j int) bool {
-		return utils2.CompareStrings(files[i].Path(), files[j].Path())
-	})
-	if fileID < 1 || fileID > len(files) {
+	tt := t.Torrent // drop() may nil the field; use one snapshot throughout
+	if tt == nil || tt.Info() == nil {
 		return false
 	}
-	f := files[fileID-1]
-	if off+n > f.Length() {
+	// Resolve the id through Status() and match by path, exactly as Stream does: ids
+	// come from Status()'s cached order, which a fresh sort need not reproduce.
+	var path string
+	for _, fs := range t.Status().FileStats {
+		if fs != nil && fs.Id == fileID {
+			path = fs.Path
+			break
+		}
+	}
+	if path == "" {
 		return false
 	}
-	first, last, ok := pieceSpan(f.Offset()+off, n, t.Torrent.Info().PieceLength)
+	var f *torrent.File
+	for _, tf := range tt.Files() {
+		if tf.Path() == path {
+			f = tf
+			break
+		}
+	}
+	if f == nil || off+n > f.Length() {
+		return false
+	}
+	first, last, ok := pieceSpan(f.Offset()+off, n, tt.Info().PieceLength)
 	if !ok {
 		return false
 	}
 	for i := first; i <= last; i++ {
-		if !t.Torrent.PieceState(i).Complete {
+		if !tt.PieceState(i).Complete {
 			return false
 		}
 	}

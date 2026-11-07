@@ -14,12 +14,12 @@ import (
 // indexCache sets the package to index mode with 1 MB windows and returns a cache in dir.
 func indexCache(t *testing.T, dir string) *DiskWarmupCache {
 	t.Helper()
-	oldHead, oldTail, oldBoundary, oldPersist, oldVerified := FileSize, TailWarmupSize, headBoundaryChunk, persistTails, RangeVerified
+	oldHead, oldTail, oldBoundary, oldPersist, oldVerified, oldFetch := FileSize, TailWarmupSize, headBoundaryChunk, persistTails, RangeVerified, TailFetch
 	t.Cleanup(func() {
-		FileSize, TailWarmupSize, headBoundaryChunk, persistTails, RangeVerified = oldHead, oldTail, oldBoundary, oldPersist, oldVerified
+		FileSize, TailWarmupSize, headBoundaryChunk, persistTails, RangeVerified, TailFetch = oldHead, oldTail, oldBoundary, oldPersist, oldVerified, oldFetch
 	})
 	FileSize, TailWarmupSize = 1<<20, 1<<20
-	headBoundaryChunk, persistTails, RangeVerified = false, true, nil
+	headBoundaryChunk, persistTails, RangeVerified, TailFetch = false, true, nil, nil
 	d := &DiskWarmupCache{dir: dir, writeCh: make(chan warmupWrite, 32)}
 	stopped := make(chan struct{})
 	go func() { d.writeWorker(); close(stopped) }()
@@ -40,7 +40,11 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 }
 
 func TestInitDiskWarmupIndexModeIgnoresUseDisk(t *testing.T) {
-	defer func() { DiskWarmup = nil; FileSize, TailWarmupSize = 64<<20, 16<<20; headBoundaryChunk, persistTails = true, false }()
+	defer func() {
+		DiskWarmup = nil
+		FileSize, TailWarmupSize = 64<<20, 16<<20
+		headBoundaryChunk, persistTails = true, false
+	}()
 	InitDiskWarmup(Options{QuotaGB: 1, Dir: t.TempDir(), HeadMB: 4, TailMB: 6})
 	if DiskWarmup == nil {
 		t.Fatal("index mode must not depend on UseDisk")
@@ -123,6 +127,14 @@ func TestUnverifiedBlocksWaitForTheirPieces(t *testing.T) {
 
 	var ok atomic.Bool
 	RangeVerified = func(string, int, int64, int64) bool { return ok.Load() }
+	// The piece is re-downloaded after a failed hash: the verified bytes are 2s, the
+	// copy the read handed out was 1s. The cache must hold the verified bytes.
+	TailFetch = func(_ string, _ int, _ int64, buf []byte) (int, error) {
+		for i := range buf {
+			buf[i] = 2
+		}
+		return len(buf), nil
+	}
 	d.WriteChunk("h", 4, bytes.Repeat([]byte{1}, 1<<20), 0)
 	time.Sleep(50 * time.Millisecond)
 	if d.GetAvailableRange("h", 4) != 0 {
@@ -134,6 +146,29 @@ func TestUnverifiedBlocksWaitForTheirPieces(t *testing.T) {
 		d.missing.Delete(d.filePath("h", 4))
 		return d.GetAvailableRange("h", 4) == 1<<20
 	})
+	buf := make([]byte, 16)
+	if n, _ := d.ReadAt("h", 4, buf, 0); n != 16 || buf[0] != 2 {
+		t.Fatalf("cache holds the pre-verification copy (n=%d first=%d)", n, buf[0])
+	}
+}
+
+func TestWaiterDoesNotResurrectARemovedFile(t *testing.T) {
+	d := indexCache(t, t.TempDir())
+	oldPoll, oldMax := verifyPollInterval, verifyWaitMax
+	defer func() { verifyPollInterval, verifyWaitMax = oldPoll, oldMax }()
+	verifyPollInterval, verifyWaitMax = 10*time.Millisecond, time.Second
+
+	var ok atomic.Bool
+	RangeVerified = func(string, int, int64, int64) bool { return ok.Load() }
+	TailFetch = func(_ string, _ int, _ int64, buf []byte) (int, error) { return len(buf), nil }
+	const fileSize = 10 << 20
+	d.WriteTail("h", 6, make([]byte, 4096), fileSize-4096, fileSize)
+	d.RemoveHash("h")
+	ok.Store(true)
+	time.Sleep(100 * time.Millisecond)
+	if _, err := os.Stat(d.tailPath("h", 6)); !os.IsNotExist(err) {
+		t.Fatal("a waiter recreated a removed tail file")
+	}
 }
 
 func TestBlocksThatNeverVerifyAreDropped(t *testing.T) {

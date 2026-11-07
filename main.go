@@ -4685,8 +4685,8 @@ func main() {
 	}
 	torrutils.SetBlockListEnabled(gc().BlockListEnabled)
 
-	// Before the engine starts serving streams (Dezoxy fork, see torr.BoundedReadahead).
-	torr.BoundedReadahead = !gc().PumpOnOpen
+	// Before the engine starts serving streams (Dezoxy fork, see torrstor.BoundedReadahead).
+	torrstor.BoundedReadahead = !gc().PumpOnOpen
 	go func() {
 		logger.Println("Starting Embedded GoStorm Engine...")
 		server.Start() // Starts Web Server on 8090 and Engine

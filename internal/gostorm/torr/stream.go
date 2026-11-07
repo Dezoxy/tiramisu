@@ -121,7 +121,7 @@ func (t *Torrent) Stream(fileID int, req *http.Request, resp http.ResponseWriter
 	}
 	// A bounded range (FetchBlock, FetchAhead) needs no read-ahead past its end; the pump
 	// asks for an open-ended one and keeps the full window (Dezoxy fork).
-	if BoundedReadahead {
+	if torrstor.BoundedReadahead {
 		if end, ok := boundedRangeEnd(req.Header.Get("Range"), file.Length()); ok {
 			reader.SetRangeEnd(end)
 		}
@@ -189,10 +189,6 @@ func (t *Torrent) Stream(fileID int, req *http.Request, resp http.ResponseWriter
 	}
 	return nil
 }
-
-// BoundedReadahead stops a bounded range's read-ahead at the range end. Set at startup
-// with pump_on_open off (Dezoxy fork); upstream reads ahead the full window.
-var BoundedReadahead bool
 
 // boundedRangeEnd returns the exclusive end of a single "bytes=a-b" range, clamped to the
 // file. Open-ended, suffix and multi-part ranges are not bounded.
