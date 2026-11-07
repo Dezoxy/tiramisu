@@ -7,7 +7,7 @@ import (
 )
 
 // Dezoxy fork: the seed endpoint reads only under index_seed_root.
-func TestPathUnder(t *testing.T) {
+func TestOpenUnder(t *testing.T) {
 	root := t.TempDir()
 	inside := filepath.Join(root, "movies", "a.mkv")
 	os.MkdirAll(filepath.Dir(inside), 0o755)
@@ -17,15 +17,18 @@ func TestPathUnder(t *testing.T) {
 	link := filepath.Join(root, "movies", "link.mkv")
 	os.Symlink(outside, link)
 
-	if _, ok := pathUnder(root, inside); !ok {
-		t.Error("file under root refused")
+	f, err := openUnder(root, inside)
+	if err != nil {
+		t.Fatalf("file under root refused: %v", err)
 	}
-	for _, p := range []string{outside, link, filepath.Join(root, "..", filepath.Base(outside)), "movies/a.mkv", ""} {
-		if _, ok := pathUnder(root, p); ok {
-			t.Errorf("%q accepted", p)
+	f.Close()
+	for _, p := range []string{outside, link, filepath.Join(root, "..", filepath.Base(outside)), "movies/a.mkv", root, ""} {
+		if f, err := openUnder(root, p); err == nil {
+			f.Close()
+			t.Errorf("%q opened", p)
 		}
 	}
-	if _, ok := pathUnder("", inside); ok {
+	if _, err := openUnder("", inside); err == nil {
 		t.Error("empty root accepted")
 	}
 }

@@ -11,8 +11,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
-	"syscall"
 	"time"
 
 	"tiramisu/internal/gostorm/torr"
@@ -49,24 +47,22 @@ type seedResponse struct {
 	Files []seedResult `json:"files"`
 }
 
-// pathUnder resolves p and reports whether it stays inside root, after symlinks.
-func pathUnder(root, p string) (string, bool) {
-	if root == "" || p == "" || !filepath.IsAbs(p) {
-		return "", false
+// openUnder opens p for reading through an os.Root at root: the kernel-side walk refuses
+// any path, ".." or symlink included, that leaves the root.
+func openUnder(root, p string) (*os.File, error) {
+	if root == "" || !filepath.IsAbs(p) {
+		return nil, errors.New("want an absolute path under index_seed_root")
 	}
-	real, err := filepath.EvalSymlinks(filepath.Clean(p))
+	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(p))
+	if err != nil || rel == "." {
+		return nil, errors.New("path is not under index_seed_root")
+	}
+	r, err := os.OpenRoot(root)
 	if err != nil {
-		return "", false
+		return nil, err
 	}
-	rootReal, err := filepath.EvalSymlinks(filepath.Clean(root))
-	if err != nil {
-		return "", false
-	}
-	rel, err := filepath.Rel(rootReal, real)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", false
-	}
-	return real, true
+	defer r.Close()
+	return r.Open(rel)
 }
 
 // virtualStub maps a path under the FUSE mount to its stub under the source tree.
@@ -125,15 +121,9 @@ func handleIndexSeed(w http.ResponseWriter, r *http.Request) {
 		}
 		hash = h
 		results[i].FileID = id
-		local, ok := pathUnder(gc().IndexSeedRoot, sf.Local)
-		if !ok {
-			http.Error(w, "local path must exist under index_seed_root: "+sf.Local, http.StatusForbidden)
-			return
-		}
-		// Resolved already; O_NOFOLLOW refuses a link swapped in since.
-		f, err := os.OpenFile(local, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+		f, err := openUnder(gc().IndexSeedRoot, sf.Local)
 		if err != nil {
-			http.Error(w, "open "+sf.Local+": "+err.Error(), http.StatusNotFound)
+			http.Error(w, "local path must be a file under index_seed_root: "+sf.Local, http.StatusForbidden)
 			return
 		}
 		defer f.Close()
