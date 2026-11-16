@@ -125,4 +125,7 @@ jobs:
         run: |
           set -eu
           { echo "Merging upstream $TAG into homelab conflicts in:"; echo '```'; cat conflicts.txt; echo '```'; } > issue.md
-          gh issue create --title "Upstream $TAG conflicts with homelab" --body-file issue.md
+          # REST, not `gh issue create`: its GraphQL createIssue mutation was refused with
+          # "Resource not accessible by integration" although this job holds issues: write.
+          gh api --method POST "repos/$GITHUB_REPOSITORY/issues" \
+            -f title="Upstream $TAG conflicts with homelab" -F body=@issue.md
