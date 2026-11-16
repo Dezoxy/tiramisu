@@ -29,6 +29,10 @@ jobs:
     name: Build and test
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      # GCC on ubuntu-26.04 defaults to C23, where go-libutp's `typedef uint8 bool` no longer
+      # compiles (upstream v1.11.11 fix, carried over from its ci.yml, which this branch removes).
+      CGO_CFLAGS: "-O2 -g -std=gnu17"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
