@@ -450,7 +450,8 @@ const (
 )
 
 type fetchFlight struct {
-	done chan struct{} // closed by the leader once its result is in raCache
+	done  chan struct{} // closed by the leader once its result is in raCache
+	start int64         // leader's read offset: its window never covers bytes below it
 }
 
 var activePumps sync.Map    // Map[string]*NativePumpState — one pump per file path
@@ -512,6 +513,10 @@ func terminateOrphanPump(path string) bool {
 }
 
 // resolveTargetFile finds the torrent hash and file index for a given URL and size.
+// resolveTargetFileFn is resolveTargetFile, a var so the FUSE-layer simulator can resolve without
+// the BitTorrent engine.
+var resolveTargetFileFn = resolveTargetFile
+
 func resolveTargetFile(url string, targetSize int64, physicalPath string) (string, int, error) {
 	if nativeBridge == nil {
 		return "", 0, fmt.Errorf("nativeBridge is nil")
@@ -663,11 +668,12 @@ func fillAttrFromStat(st *syscall.Stat_t, out *fuse.Attr) {
 	out.Blocks = uint64(st.Blocks)           // CRITICAL: Samba uses for throughput calc
 	out.Size = uint64(st.Size)
 
-	// Use time.Now() as cross-platform baseline for virtualized FUSE attributes.
-	now := time.Now()
-	out.Mtime = sanitizeTime(now)
-	out.Atime = sanitizeTime(now)
-	out.Ctime = sanitizeTime(now)
+	// The physical directory's times: they move only when a stub is added or removed, so a
+	// scanner can skip unchanged folders. time.Now() made every folder look modified.
+	mtime, ctime := vfs.StatTimes(st)
+	out.Mtime = sanitizeTime(mtime)
+	out.Atime = out.Mtime
+	out.Ctime = sanitizeTime(ctime)
 }
 
 // fillAttrFromMetadata populates FUSE attributes from our internal Metadata.
@@ -1169,6 +1175,32 @@ func invalidateSyncRemovedPath(path string) {
 		}
 	}
 	globalDirCache.Delete(path)
+	notifyKernelEntry(path)
+}
+
+// fuseMaxBackground is fuse_max_background, or master_concurrency_limit when unset.
+func fuseMaxBackground() int {
+	if n := gc().FuseMaxBackground; n > 0 {
+		return n
+	}
+	return gc().ConcurrencyLimit
+}
+
+// kernelRoot is the mounted root inode, for kernel cache invalidation; nil until mounted.
+var kernelRoot atomic.Pointer[fs.Inode]
+
+// notifyKernelEntry drops the kernel's dentry for a physical path, so entry TTLs longer than a
+// second never show a removed stub. Listings are not kernel-cached, only the dircache above.
+func notifyKernelEntry(path string) {
+	root := kernelRoot.Load()
+	if root == nil || physicalSourcePath == "" {
+		return
+	}
+	rel, err := filepath.Rel(physicalSourcePath, path)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return
+	}
+	safeGo(func() { vfs.NotifyEntryPath(root, filepath.ToSlash(rel)) })
 }
 
 // Unlink handles file deletion and triggers torrent auto-remove (FASE 4.2)
@@ -1302,6 +1334,7 @@ func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 	if wake == nil && nativeBridge != nil {
 		wake = nativeBridge.Wake
 	}
+	var wakeWait *pendingWake
 	if wake != nil && magnetCandidate != "" {
 		if headReady {
 			// Open returns instantly here, so the activation must not inherit the
@@ -1327,30 +1360,29 @@ func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 			if ctx.Err() != nil {
 				return nil, 0, syscall.EINTR
 			}
-			// A synchronous activation that cannot start is terminal: returning a
-			// handle here gives a scanner a file whose reads can never be served.
-			// The request context goes with it, so a cancelled Open makes the wake
-			// return (and release its semaphore token) instead of running to the
-			// metadata timeout detached.
-			activated := make(chan error, 1)
-			go func() {
-				// A panicking activation must fail the Open, not take the process down.
+			// Samba runs CREATE on the client's single smbd process, so waiting here for a cold
+			// activation (up to the 45s metadata timeout) froze every Plex session of that client.
+			// An activation that fails within the grace still fails Open; a slower one goes on in
+			// the background and the handle's first read waits for it, on Samba's aio threads.
+			pw := &pendingWake{done: make(chan struct{})}
+			if err := vfs.StartWake(func(c context.Context) (err error) {
+				// done must close even on panic, or the handle's reads would wait forever.
 				defer func() {
 					if r := recover(); r != nil {
-						logger.Printf("[PANIC] wake goroutine recovered for %s: %v\n%s", magnetCandidate, r, debug.Stack())
-						activated <- fmt.Errorf("activation panicked: %v", r)
+						err = fmt.Errorf("activation panicked: %v", r)
 					}
+					pw.err = err
+					close(pw.done)
 				}()
-				activated <- wake(ctx, magnetCandidate, urlFileIdx)
-			}()
+				return wake(c, magnetCandidate, urlFileIdx)
+			}, videoWakeGrace, logger.Printf); err != nil {
+				logger.Printf("[VFS] activation failed for %s: %v", n.vMeta.Path, err)
+				return nil, 0, syscall.EIO
+			}
 			select {
-			case err := <-activated:
-				if err != nil {
-					logger.Printf("[VFS] activation failed for %s: %v", n.vMeta.Path, err)
-					return nil, 0, syscall.EIO
-				}
-			case <-ctx.Done():
-				return nil, 0, syscall.EINTR
+			case <-pw.done:
+			default:
+				wakeWait = pw
 			}
 		}
 	}
@@ -1405,7 +1437,7 @@ func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 		isNative = true
 	} else {
 		var err error
-		finalHash, fileIdx, err = resolveTargetFile(n.vMeta.URL, n.vMeta.Size, n.vMeta.Path)
+		finalHash, fileIdx, err = resolveTargetFileFn(n.vMeta.URL, n.vMeta.Size, n.vMeta.Path)
 		isNative = (err == nil)
 		if !isNative && gc().LogLevel == "DEBUG" {
 			logger.Printf("[NativeBridge] Resolution failed for %s: %v. Access will rely on cache/retry.", filepath.Base(n.vMeta.Path), err)
@@ -1413,6 +1445,8 @@ func (n *VirtualMkvNode) Open(ctx context.Context, flags uint32) (fs.FileHandle,
 	}
 
 	h := &MkvHandle{
+		wakeWait:         wakeWait,
+		openedAt:         time.Now(),
 		url:              n.vMeta.URL,
 		magnet:           magnetCandidate, // Store for potential re-wake
 		wake:             wake,
@@ -1513,6 +1547,38 @@ type MkvHandle struct {
 	pumpOnce        sync.Once
 	isPrimaryHandle atomic.Bool  // pump creator, primary reconnects (refCount 0→1), proven readers
 	seqAdvances     atomic.Int32 // consecutive sequential streaming reads, feeds the promotion below
+	headerChainEnd  atomic.Int64 // end of the last header read skipped by isHeaderRead, 0 if none
+	released        atomic.Bool  // Release ran once (orphan GC or kernel)
+	seqRun          atomic.Int32 // consecutive streaming advances, primary or not (feeds streamedOnce)
+	streamedOnce    atomic.Bool  // read sequentially like a player at least once
+	openedAt        time.Time    // set once at Open
+	wakeWait        *pendingWake // activation still running when Open returned; set once
+}
+
+// pendingWake is a torrent activation Open stopped waiting for.
+type pendingWake struct {
+	done chan struct{}
+	err  error // valid once done is closed
+}
+
+// videoWakeGrace is how long Open waits for a cold video activation before handing it to the reads.
+const videoWakeGrace = 2 * time.Second
+
+// awaitWake blocks a read until the activation Open left running ends.
+func (h *MkvHandle) awaitWake(ctx context.Context) syscall.Errno {
+	pw := h.wakeWait
+	if pw == nil {
+		return 0
+	}
+	select {
+	case <-pw.done:
+		if pw.err != nil {
+			return syscall.EIO
+		}
+		return 0
+	case <-ctx.Done():
+		return syscall.EINTR
+	}
 }
 
 // startNativePump acquires a slot and starts the background pump.
@@ -1772,10 +1838,14 @@ func (h *MkvHandle) nativePump(ctx context.Context, pumpReader *native.NativeRea
 		logger.Printf("[Pump] reader is nil at startup for %s", filepath.Base(h.path))
 		return
 	}
+	// ctx is checked only at the top of the loop; without this a cancelled pump blocked in
+	// ReadAt keeps its slot and keeps downloading until the stream timeout (seen up to 90s).
+	stopInterruptOnCancel := context.AfterFunc(ctx, pumpReader.Interrupt)
+	defer stopInterruptOnCancel()
 
 	if h.hash == "" {
 		// Late hash resolution for handles where Open() didn't complete it.
-		if hash, fileID, err := resolveTargetFile(h.url, h.size, h.path); err == nil {
+		if hash, fileID, err := resolveTargetFileFn(h.url, h.size, h.path); err == nil {
 			h.mu.Lock()
 			h.hash = hash
 			h.fileID = fileID
@@ -1818,6 +1888,7 @@ func (h *MkvHandle) nativePump(ctx context.Context, pumpReader *native.NativeRea
 
 	// V752: starvation watchdog state — sliding 10s window + last revival time.
 	var watchSamples []watchSample
+	lastPlayerOff := int64(0) // kept while the primary only reads the SSD tail
 	lastRevival := time.Now().Add(-time.Hour)
 
 	chunkSize := raCache.ChunkSize(h.path)
@@ -1886,15 +1957,30 @@ func (h *MkvHandle) nativePump(ctx context.Context, pumpReader *native.NativeRea
 		// Sync to primary handles only; secondary metadata probes cause false 10GB+ jumps.
 		now := time.Now()
 		playerOff := int64(0)
+		tailOnly := false
+		anyReaderOff := int64(0) // any handle, tail probes excluded: before confirmation the player can be a secondary
 		activeHandles.Range(func(key, value interface{}) bool {
 			handle := key.(*MkvHandle)
-			if handle.path == h.path && handle.isPrimaryHandle.Load() {
-				if off := atomic.LoadInt64(&handle.lastOff); off > playerOff {
-					playerOff = off
+			if handle.path == h.path {
+				off := atomic.LoadInt64(&handle.lastOff)
+				// SSD-tail reads are Cues probes served from disk: following them sent the pump to EOF.
+				if handle.isPrimaryHandle.Load() {
+					if shouldServeTailFromSSD(off, h.size, warmup.TailWarmupSize) {
+						tailOnly = true
+					} else if off > playerOff {
+						playerOff = off
+					}
+				}
+				if off > anyReaderOff && off < h.size-tailProbeZoneSize(h.size) {
+					anyReaderOff = off
 				}
 			}
 			return true
 		})
+		if playerOff == 0 && tailOnly {
+			playerOff = lastPlayerOff
+		}
+		lastPlayerOff = playerOff
 
 		// Snap pump to player position when seek gap exceeds budget, aligned to chunk boundary.
 		jumpThreshold := int64(gc().ReadAheadBudget)
@@ -1972,8 +2058,16 @@ func (h *MkvHandle) nativePump(ctx context.Context, pumpReader *native.NativeRea
 			}
 		}
 
+		if probePumpParked(playbackConfirmedOrInferred, max(playerOff, anyReaderOff), offset, chunkSize) {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
 		stop, nextOffset := h.nativePumpChunk(pumpReader, offset, chunkSize, playerOff)
 		if stop {
+			if ctx.Err() != nil {
+				return
+			}
 			// Transient errors (seek interrupt, reconnect, piece timeout): retry until genuine EOF.
 			if offset < h.size {
 				time.Sleep(200 * time.Millisecond)
@@ -1989,6 +2083,18 @@ func (h *MkvHandle) nativePump(ctx context.Context, pumpReader *native.NativeRea
 		pumpedBytes += (nextOffset - offset)
 		offset = nextOffset
 	}
+}
+
+// probePumpParked reports whether a pump with no evidence of playback has filled enough. Every
+// Open starts a pump, and a probe that read only the header left it free to fetch the full lead
+// (~200MB) into nothing. Until playback is confirmed/inferred or any handle reads past the header
+// (tail probes excluded; before confirmation the player is often an attached secondary), the pump
+// fills the warmup head plus one chunk; a real player crosses 2MB within a second.
+func probePumpParked(confirmedOrInferred bool, playerOff, offset, chunkSize int64) bool {
+	if confirmedOrInferred || playerOff >= headerProbeZone {
+		return false
+	}
+	return offset >= warmup.FileSize+chunkSize
 }
 
 // nativePumpChunk reads a single chunk from the Native pipe into raCache.
@@ -2112,10 +2218,72 @@ func (h *MkvHandle) nativePumpChunk(r *native.NativeReader, offset, chunkSize, p
 	return false, got
 }
 
+// pathPlaybackActive reports confirmed or inferred playback on path.
+func pathPlaybackActive(path string) bool {
+	val, ok := playbackRegistry.Load(path)
+	if !ok {
+		return false
+	}
+	ps, ok := val.(*PlaybackState)
+	return ok && (ps.GetStatus() || ps.IsInferredPlayback())
+}
+
+// headerProbeZone is the start of the file that players and Samba re-read for container headers.
+const headerProbeZone = 2 * 1024 * 1024
+
+// headerChainLimit bounds how far a header read may continue sequentially and still count as one:
+// the SSD warmup head (64MB by default). Plex's head reads ran past 16MB on every resume; inside
+// the head the SSD serves the reads and the pump skips that zone anyway, so a player that really
+// starts over loses nothing waiting until the head ends to reposition the pump.
+func headerChainLimit() int64 {
+	if warmup.FileSize > 16*1024*1024 {
+		return warmup.FileSize
+	}
+	return 16 * 1024 * 1024
+}
+
+// isHeaderRead reports a header read by a handle already positioned past it, or a read continuing
+// one sequentially up to headerChainLimit. It is not a seek (82% of seek interrupts in production
+// landed here) and must not move the handle's offset, which the pump follows and Release persists
+// as the resume position.
+func isHeaderRead(prevOff, off, chainEnd, tolerance int64) bool {
+	if prevOff < headerProbeZone {
+		return false
+	}
+	if off < headerProbeZone {
+		return true
+	}
+	limit := headerChainLimit()
+	if off < limit && prevOff >= limit {
+		// Plex parses the head out of order (2MB, then 28MB): any read inside the SSD head by a
+		// handle positioned past it is still header parsing, sequential or not.
+		return true
+	}
+	return chainEnd > 0 && off < limit && abs(off-chainEnd) <= tolerance
+}
+
+// classifyHeaderRead applies isHeaderRead and tracks the chain for the next read.
+func (h *MkvHandle) classifyHeaderRead(prevOff, off int64, n int) bool {
+	if !isHeaderRead(prevOff, off, h.headerChainEnd.Load(), gc().SequentialTolerance) {
+		h.headerChainEnd.Store(0)
+		return false
+	}
+	h.headerChainEnd.Store(off + int64(n))
+	return true
+}
+
+// storeReadOff records off as the handle's position unless it is a header read.
+func (h *MkvHandle) storeReadOff(headerRead bool, off int64) {
+	if headerRead {
+		return
+	}
+	atomic.StoreInt64(&h.lastOff, off)
+}
+
 // shouldInterruptForSeek returns true for genuine seeks beyond budget.
 // Ignores: new handles (prevOff<=0), Samba header probes (off==0), sequential reads.
 func shouldInterruptForSeek(prevOff, off, budget int64) bool {
-	if prevOff <= 0 || off == 0 {
+	if prevOff <= 0 || off == 0 || (off < headerProbeZone && prevOff >= headerProbeZone) {
 		return false
 	}
 	return off > prevOff+budget || prevOff > off+budget
@@ -2155,10 +2323,16 @@ func advanceProvesStreaming(prevOff, off, readLen, size, tolerance, streamingThr
 const primaryProofReads = 3 // consecutive sequential reads before a handle drives the pump
 
 func (h *MkvHandle) promoteIfStreaming(prevOff, off int64, readLen int) {
+	advance := prevOff >= 0 && advanceProvesStreaming(prevOff, off, int64(readLen), h.size, gc().SequentialTolerance, gc().StreamingThreshold)
+	if !advance {
+		h.seqRun.Store(0)
+	} else if h.seqRun.Add(1) >= primaryProofReads {
+		h.streamedOnce.Store(true)
+	}
 	if h.isPrimaryHandle.Load() || h.hash == "" || prevOff < 0 {
 		return
 	}
-	if !advanceProvesStreaming(prevOff, off, int64(readLen), h.size, gc().SequentialTolerance, gc().StreamingThreshold) {
+	if !advance {
 		h.seqAdvances.Store(0)
 		return
 	}
@@ -2174,6 +2348,16 @@ func (h *MkvHandle) promoteIfStreaming(prevOff, off int64, readLen int) {
 	ps, ok := val.(*PlaybackState)
 	if !ok || !(ps.GetStatus() || ps.IsInferredPlayback()) {
 		return
+	}
+	// A second sequential reader (Plex intro or loudness analysis) must not take the pump from a
+	// player that is watching: they swapped primary back and forth (fusesim analysis_same_file).
+	if inc := activeStreamingPrimary(h.path, h); inc != nil {
+		ps.mu.RLock()
+		confirmedAt := ps.ConfirmedAt
+		ps.mu.RUnlock()
+		if !mayTakeOverStreamingPrimary(h, inc, confirmedAt) {
+			return
+		}
 	}
 	if becomePrimary(h) {
 		logger.Printf("[V284] Handle promoted to primary after %d sequential reads at %dMB: %s",
@@ -2246,9 +2430,10 @@ func resumeAnchorFromPersisted(lastSeekOff, size int64) (anchor int64, zeroed bo
 // + ResetShield() would only stall a pump the read does not need. The old isTailProbe
 // gate was unreachable dead state (any read in the tail zone first transitions
 // WARMUP→STREAMING), so a live scrub into the last 16MB interrupted the pump even
-// though the SSD served the read instantly.
-func shouldInterruptPump(prevOff, off, budget int64, tailServed bool) bool {
-	if tailServed {
+// though the SSD served the read instantly. Leaving the SSD tail is no seek either: Plex reads
+// the Cues there and then the head, which interrupted the pump and reset the global shield.
+func shouldInterruptPump(prevOff, off, budget int64, tailServed, prevTailServed bool) bool {
+	if tailServed || prevTailServed {
 		return false
 	}
 	return shouldInterruptForSeek(prevOff, off, budget)
@@ -2290,6 +2475,48 @@ func primaryOffsetFor(path string, except *MkvHandle) int64 {
 		return true
 	})
 	return off
+}
+
+// primaryActiveWindow is how recently a primary that has streamed must have read to count as a
+// player that is watching.
+const primaryActiveWindow = 2 * time.Second
+
+// primaryStreamingFor reports a primary handle on path, other than except, that has streamed like
+// a player and read within primaryActiveWindow. A stale probe primary (header and Cues only) never
+// streamed, so it does not block the real player's promotion.
+func primaryStreamingFor(path string, except *MkvHandle) bool {
+	return activeStreamingPrimary(path, except) != nil
+}
+
+// mayTakeOverStreamingPrimary reports whether h may take primary from inc, a primary that is
+// watching. Only the player of a session that started while inc was already reading qualifies:
+// opened after inc, and before Plex confirmed the playback. An analysis started during a confirmed
+// session opens after the confirmation (fusesim analysis_same_file); when the analysis was running
+// first, the player opens after it and before the webhook (fusesim analysis_then_play).
+func mayTakeOverStreamingPrimary(h, inc *MkvHandle, confirmedAt time.Time) bool {
+	return !h.openedAt.IsZero() && h.openedAt.After(inc.openedAt) && !h.openedAt.After(confirmedAt)
+}
+
+// activeStreamingPrimary returns the primary handle on path, other than except, that has streamed
+// like a player and read within primaryActiveWindow, or nil.
+func activeStreamingPrimary(path string, except *MkvHandle) *MkvHandle {
+	var found *MkvHandle
+	now := time.Now()
+	activeHandles.Range(func(key, _ interface{}) bool {
+		other, ok := key.(*MkvHandle)
+		if !ok || other == except || other.path != path || !other.isPrimaryHandle.Load() || !other.streamedOnce.Load() {
+			return true
+		}
+		other.mu.Lock()
+		last := other.lastActivityTime
+		other.mu.Unlock()
+		if now.Sub(last) <= primaryActiveWindow {
+			found = other
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 // becomePrimary makes h the only primary handle for its path, returning false if it already was.
@@ -2574,11 +2801,14 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 	if off >= h.size {
 		return fuse.ReadResultData(nil), 0
 	}
+	if errno := h.awaitWake(fuseCtx); errno != 0 {
+		return nil, errno
+	}
 
 	h.mu.Lock()
 	// Late hash recovery: if Open() failed to resolve (metadata lag), retry now.
 	if h.hash == "" && h.url != "" {
-		if hash, fileID, err := resolveTargetFile(h.url, h.size, h.path); err == nil {
+		if hash, fileID, err := resolveTargetFileFn(h.url, h.size, h.path); err == nil {
 			h.hash = hash
 			h.fileID = fileID
 			logger.Printf("[LateResolution] Recovered hash for %s: %s", filepath.Base(h.path), h.hash[:8])
@@ -2614,7 +2844,8 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 	h.mu.Unlock()
 
 	prevOff := atomic.LoadInt64(&h.lastOff)
-	atomic.StoreInt64(&h.lastOff, off)
+	headerRead := h.classifyHeaderRead(prevOff, off, len(dest))
+	h.storeReadOff(headerRead, off)
 
 	h.promoteIfStreaming(prevOff, off, len(dest))
 
@@ -2632,7 +2863,7 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 			if off >= warmup.FileSize {
 				isSeek = true
 			}
-		} else if off != 0 {
+		} else if off != 0 && !headerRead {
 			budget := int64(gc().ReadAheadBudget)
 			if off > prevOff+budget || prevOff > off+budget {
 				isSeek = true
@@ -2702,14 +2933,18 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 	// restarts and resets the flag (preventing the thrash loop seen in the logs).
 	budget := int64(gc().ReadAheadBudget)
 	seekReader := h.nativeReader // capture: a concurrent Release nils the field
-	if seekReader != nil && shouldInterruptPump(prevOff, off, budget, shouldServeTailFromSSD(off, h.size, warmup.TailWarmupSize)) {
+	if seekReader != nil && !headerRead && shouldInterruptPump(prevOff, off, budget, shouldServeTailFromSSD(off, h.size, warmup.TailWarmupSize),
+		prevOff >= 0 && shouldServeTailFromSSD(prevOff, h.size, warmup.TailWarmupSize)) {
 		// Promote to primary on a genuine seek once playback is confirmed/inferred - mirrors the
 		// refCount 0->1 "primary reconnect" promotion at attach time (main.go:1030): a secondary
 		// (attached) handle doing a real seek during confirmed playback IS the player, and needs
 		// isPrimaryHandle so the pump loop's playerOff sync and Release's ps.playerOff
 		// persistence (see nativePump) pick it up instead of only the original primary handle,
 		// which may be an idle stale probe by now.
-		if !h.isPrimaryHandle.Load() {
+		// Only a handle that has streamed like a player qualifies, and never over a primary that is
+		// watching: Plex's sparse probes (chapter thumbnails, analysis) would otherwise take the
+		// pump with every far read (fusesim metadata_probe_same_file: 8 moves, 9 interrupts).
+		if !h.isPrimaryHandle.Load() && h.streamedOnce.Load() && !primaryStreamingFor(h.path, h) {
 			if val, ok := playbackRegistry.Load(h.path); ok {
 				if pbs, ok := val.(*PlaybackState); ok && (pbs.GetStatus() || pbs.IsInferredPlayback()) {
 					becomePrimary(h)
@@ -2720,7 +2955,8 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 		if val, ok := activePumps.Load(h.path); ok {
 			ps = val.(*NativePumpState)
 		}
-		if ps == nil || !ps.interruptPending.Swap(true) {
+		// The pump follows the primary: a secondary's seek has nothing of the pump to interrupt.
+		if h.isPrimaryHandle.Load() && (ps == nil || !ps.interruptPending.Swap(true)) {
 			seekReader.Interrupt()
 			torrstor.ResetShield()
 			h.state.Store(stateStreaming)
@@ -2784,7 +3020,7 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 				if off == 0 {
 					logger.Printf("[DiskWarmup] HIT %s off=0 (%dKB)", filepath.Base(h.path), n/1024)
 				}
-				atomic.StoreInt64(&h.lastOff, off)
+				h.storeReadOff(headerRead, off)
 
 				h.mu.Lock()
 				h.lastLen = n
@@ -2843,7 +3079,7 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 		timing.UsedCache = true
 		timing.BytesRead = n
 
-		atomic.StoreInt64(&h.lastOff, off)
+		h.storeReadOff(headerRead, off)
 
 		// Predictive prefetch: fetch next chunk if pump is absent or near boundary.
 		chunkSize := raCache.ChunkSize(h.path)
@@ -2902,8 +3138,16 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 	}
 
 	target := int(end - off + 1)
-	isSeq := (off == h.lastOff+int64(h.lastLen)) || (h.lastOff >= 0 && abs(off-(h.lastOff+int64(h.lastLen))) <= gc().SequentialTolerance)
-	isStreaming := (len(dest) >= int(gc().StreamingThreshold)) || isSeq
+	// h.lastOff already holds off here (stored above), so sequentiality is judged on prevOff.
+	h.mu.Lock()
+	prevLen := int64(h.lastLen)
+	h.mu.Unlock()
+	isSeq := prevOff >= 0 && abs(off-(prevOff+prevLen)) <= gc().SequentialTolerance
+	// Only unconfirmed probes lose the window. A handle's first read, the primary and any read
+	// during playback keep it: before promotion the player is often a secondary reading 64KB
+	// blocks, and a target-sized fetch would cost resume and seek one more round trip.
+	isStreaming := (len(dest) >= int(gc().StreamingThreshold)) || isSeq || isFirstBlock ||
+		prevOff < 0 || h.isPrimaryHandle.Load() || pathPlaybackActive(h.path)
 	timing.IsStreaming = isStreaming
 
 	fetchEnd := end
@@ -2927,7 +3171,7 @@ func (h *MkvHandle) readInner(fuseCtx context.Context, dest []byte, off int64) (
 	h.mu.Lock()
 	h.lastLen, h.lastTime = len(dest), now
 	h.mu.Unlock()
-	atomic.StoreInt64(&h.lastOff, off)
+	h.storeReadOff(headerRead, off)
 
 	if !h.hasSlot.Load() {
 		pumpCreationMu.Lock()
@@ -3021,7 +3265,7 @@ pumpSlotResolved:
 	// Queueing (semaphore/rate-limiter) is not cache service time — re-stamp.
 	cacheStart = time.Now()
 	if n := raCache.CopyTo(h.path, off, end, dest); n > 0 {
-		atomic.StoreInt64(&h.lastOff, off)
+		h.storeReadOff(headerRead, off)
 		h.mu.Lock()
 		h.lastLen = n
 		h.lastTime = now
@@ -3040,13 +3284,19 @@ pumpSlotResolved:
 	// earlier would find nothing cached and start a duplicate fetch of the same chunk.
 	releaseFlight := func() {}
 	fetchHandedOff := false
+	belowLeader := false
 
 	// Dedup concurrent misses in the same chunk: leader fetches, followers wait and copy.
 	if h.hash != "" {
 		flightChunk := raCache.ChunkSize(h.path)
 		flightKey := fmt.Sprintf("%s:%d", h.path, (off/flightChunk)*flightChunk)
-		newFlight := &fetchFlight{done: make(chan struct{})}
-		if val, loaded := inFlightFetches.LoadOrStore(flightKey, newFlight); loaded {
+		newFlight := &fetchFlight{done: make(chan struct{}), start: off}
+		if val, loaded := inFlightFetches.LoadOrStore(flightKey, newFlight); loaded && off < val.(*fetchFlight).start {
+			// The leader's window starts above us and keys the same raCache slot: waiting would
+			// last the whole window, and a windowed Put of ours would overwrite the leader's.
+			// Fetch just our bytes and leave raCache to the leader.
+			belowLeader = true
+		} else if loaded {
 			fl := val.(*fetchFlight)
 			copyStart := time.Now()
 			// The leader re-caches its window as it fills, so poll instead of waiting for the
@@ -3058,7 +3308,7 @@ pumpSlotResolved:
 					fetchFlightDedupCount.Add(1)
 					timing.UsedCache = true
 					timing.BytesRead = nCopy
-					atomic.StoreInt64(&h.lastOff, off)
+					h.storeReadOff(headerRead, off)
 					h.mu.Lock()
 					h.lastLen = nCopy
 					h.lastTime = now
@@ -3128,9 +3378,12 @@ pumpSlotResolved:
 			// The window keeps filling after this read returns. Re-cache on every step so the
 			// reads queued behind this one find their bytes as they land instead of waiting for
 			// the whole window; the buffer goes back to the pool only once the fill is done.
+			if belowLeader && limit > int64(target) {
+				buf = buf[:target]
+			}
 			nFetch, err := nativeBridge.FetchAhead(h.hash, h.fileID, off, buf, dest[:target],
 				func(total int, done bool, _ error) {
-					if total > 0 {
+					if total > 0 && !belowLeader {
 						raCache.Put(h.path, off, off+int64(total)-1, buf[:total])
 					}
 					if !done {
@@ -3173,7 +3426,7 @@ DATA_READY:
 		ttffRead(h.path, srcFetchBlock, timing.HTTPFetchTime, n, off)
 
 		// Update sequential detection state
-		atomic.StoreInt64(&h.lastOff, off)
+		h.storeReadOff(headerRead, off)
 		h.mu.Lock()
 		h.lastLen = target
 		h.mu.Unlock()
@@ -3284,6 +3537,10 @@ func ownsPumpState(handleState, registered *NativePumpState) bool {
 }
 
 func (h *MkvHandle) Release(fuseCtx context.Context) syscall.Errno {
+	// The orphan-handle GC releases too; the kernel's later RELEASE must not decrement twice.
+	if h.released.Swap(true) {
+		return 0
+	}
 	ttffReleaseClose(h.path)
 	logger.Printf("=== RELEASE VIRTUAL === path=%s", h.path)
 
@@ -5537,7 +5794,10 @@ func main() {
 		MountOptions: fuse.MountOptions{
 			MaxInflightRequestBytes: maxInflight,
 			AllowOther:              true,
-			MaxBackground:           gc().ConcurrencyLimit,
+			MaxBackground:           fuseMaxBackground(),
+			// Reads are served from memory, where splice only adds a copy through a pipe; with 1MB
+			// readahead every reply also overflowed the 1MB pipe and logged "trySplice" per read.
+			DisableSplice: true,
 			// MaxWrite:                 1024 * 1024,
 			MaxWrite: 4 * 1024 * 1024, // Samba Turbo: 4MB write buffer
 			// MaxReadAhead:             1024 * 1024,
@@ -5556,6 +5816,8 @@ func main() {
 	}
 
 	logger.Printf("FUSE mounted at %s with VirtualMkvRoot, all systems active", mount)
+	kernelRoot.Store(rootData.EmbeddedInode())
+	vfs.SetMountReadAhead(mount, gc().FuseReadAheadKB)
 
 	go smbdWatchdog()
 	go ttffCleanupLoop()

@@ -150,9 +150,7 @@ func (r *Reader) SetReadahead(length int64) {
 	if r.cache == nil {
 		return
 	}
-	// V255: Removed V244 85% clamp — it reduced prefetch by ~13MB without benefit.
-	// Cache eviction is LRU-based and doesn't use readahead boundaries.
-	// Unbounded readahead growth is now prevented by maxDefaultReadahead cap in anacrolix fork.
+	// Eviction protects the readahead (getOffsetRange), up to 85% of the per-reader share.
 	atomic.StoreInt64(&r.readahead, length) // AdjustRA writes it without mu
 	if !r.isUse {
 		return
@@ -271,8 +269,7 @@ func (r *Reader) getOffsetRange() (int64, int64) {
 	// when cache is full, leading to deadlock/OOM.
 	safetyFactor := 0.85
 
-	beginOffset := currentOffset - int64(float64(r.cache.capacity/readers)*safetyFactor*float64(100-prc)/100.0)
-	endOffset := currentOffset + int64(float64(r.cache.capacity/readers)*safetyFactor*float64(prc)/100.0)
+	beginOffset, endOffset := protectedWindow(currentOffset, int64(float64(r.cache.capacity/readers)*safetyFactor), prc, r.Readahead())
 
 	if beginOffset < 0 {
 		beginOffset = 0
