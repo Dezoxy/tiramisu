@@ -53,3 +53,42 @@ func TestPackEpisode(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildMovieFilenameYear(t *testing.T) {
+	const hash = "0123456789abcdef0123456789abcdef01234567"
+	for _, c := range []struct {
+		name, title, date, want string
+	}{
+		{"full date", "Film", "2019-05-17", "Film_2019_1080p_01234567.mkv"},
+		{"bare year", "Film", "2019", "Film_2019_1080p_01234567.mkv"},
+		{"short date", "Film", "201", "Film_1080p_01234567.mkv"},
+		{"short date, year in title", "Film (2001)", "20", "Film_2001_2001_1080p_01234567.mkv"},
+		{"non-digit", "Film", "20a5-01-01", "Film_1080p_01234567.mkv"},
+		{"path characters", "Film", "../x", "Film_1080p_01234567.mkv"},
+		{"path separators in year", "Film", "2/\\5-01-01", "Film_1080p_01234567.mkv"},
+		{"non-ASCII digits", "Film", "٢٠١٩-01-01", "Film_1080p_01234567.mkv"},
+		{"non-ASCII letters", "Film", "20é5", "Film_1080p_01234567.mkv"},
+		{"malformed falls back to title year", "Film.2008.x", "../x", "Film.2008.x_2008_1080p_01234567.mkv"},
+		{"empty", "Film", "", "Film_1080p_01234567.mkv"},
+	} {
+		got := BuildMovieFilename(MovieName{Title: c.title, ReleaseDate: c.date, Hash: hash})
+		if got != c.want {
+			t.Errorf("%s: got %q want %q", c.name, got, c.want)
+		}
+	}
+}
+
+func TestShowFolderNameYear(t *testing.T) {
+	for _, c := range []struct{ name, date, want string }{
+		{"full date", "2011-04-17", "Show (2011)"},
+		{"short date", "201", "Show"},
+		{"non-digit", "20a5-01-01", "Show"},
+		{"path characters", "../x", "Show"},
+		{"non-ASCII", "٢٠١٩-01-01", "Show"},
+		{"empty", "", "Show"},
+	} {
+		if got := ShowFolderName("Show", c.date); got != c.want {
+			t.Errorf("%s: got %q want %q", c.name, got, c.want)
+		}
+	}
+}

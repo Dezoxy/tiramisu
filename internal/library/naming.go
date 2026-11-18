@@ -52,14 +52,28 @@ func SanitizeMovieName(s string) string {
 	return strings.Trim(s, "_")
 }
 
+// releaseYear returns the leading 4 ASCII digits of a release date, or "" for anything
+// else: the year ends up in file and folder names, so no other character may through.
+func releaseYear(date string) string {
+	if len(date) < 4 {
+		return ""
+	}
+	for i := 0; i < 4; i++ {
+		if date[i] < '0' || date[i] > '9' {
+			return ""
+		}
+	}
+	return date[:4]
+}
+
 // BuildMovieFilename returns the stub name for a movie. The trailing 8 chars are the
 // tail of the info hash: that suffix is how an already-present title is recognised.
 func BuildMovieFilename(n MovieName) string {
-	year := ""
-	if len(n.ReleaseDate) >= 4 {
-		year = n.ReleaseDate[:4]
-	} else if m := reTitleYear.FindStringSubmatch(n.Title); len(m) > 2 {
-		year = m[2]
+	year := releaseYear(n.ReleaseDate)
+	if year == "" {
+		if m := reTitleYear.FindStringSubmatch(n.Title); len(m) > 2 {
+			year = m[2]
+		}
 	}
 
 	base := SanitizeMovieName(n.Title)
@@ -124,8 +138,8 @@ func SanitizeShowName(name string) string {
 
 func ShowFolderName(showName, firstAirDate string) string {
 	clean := SanitizeShowName(showName)
-	if len(firstAirDate) >= 4 {
-		return fmt.Sprintf("%s (%s)", clean, firstAirDate[:4])
+	if year := releaseYear(firstAirDate); year != "" {
+		return fmt.Sprintf("%s (%s)", clean, year)
 	}
 	return clean
 }
